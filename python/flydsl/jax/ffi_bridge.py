@@ -9,7 +9,7 @@ custom-call target so that ``jax.jit`` can invoke it.
 
 Calling convention translation
 ------------------------------
-XLA GPU custom call (``api_version=0``)::
+XLA GPU custom call (``api_version=1`` / ``API_VERSION_STATUS_RETURNING``)::
 
     void custom_call(hipStream_t stream,
                      void** buffers,       // buffers[0..n_in-1] = inputs,
@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
-import struct
 import threading
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -46,7 +45,6 @@ except ImportError as exc:
     ) from exc
 
 from ..compiler.jit_executor import CompiledArtifact
-from ..compiler.jit_function import MlirCompiler
 from ..expr.typing import Stream
 
 # ---------------------------------------------------------------------------
@@ -74,7 +72,7 @@ class _RegisteredTarget:
 # Calling-convention bridge (ctypes)
 # ---------------------------------------------------------------------------
 
-# XLA GPU custom call signature (api_version=0):
+# XLA GPU custom call signature (API_VERSION_STATUS_RETURNING):
 #   void fn(hipStream_t stream, void** buffers, const char* opaque, size_t opaque_len)
 _XLA_GPU_CALL_TYPE = ctypes.CFUNCTYPE(
     None,
@@ -114,10 +112,11 @@ def _make_xla_bridge(
     def _init_storage():
         # Storage cells: one c_void_p per argument.
         storage = (ctypes.c_void_p * n_fly_args)()
-        # Packed pointer array: each element points to the corresponding storage cell.
+        # Packed pointer array: each element points to the corresponding
+        # storage cell.  Use ctypes.addressof on each element for safety.
         packed = (ctypes.c_void_p * n_fly_args)()
         for i in range(n_fly_args):
-            packed[i] = ctypes.addressof(storage) + i * ctypes.sizeof(ctypes.c_void_p)
+            packed[i] = ctypes.addressof(storage[i])
         tls.storage = storage
         tls.packed = packed
 
@@ -128,7 +127,7 @@ def _make_xla_bridge(
         storage = tls.storage
         packed = tls.packed
 
-        # Unpack XLA's buffers array (void** → individual void*).
+        # Unpack XLA's buffers array (void** -> individual void*).
         # buffers_ptr points to a C array of void* pointers.
         xla_buffers = ctypes.cast(buffers_ptr, ctypes.POINTER(ctypes.c_void_p))
         for i in range(n_buffers):
@@ -159,19 +158,24 @@ def compile_and_register(
     input_shapes: List[Tuple[Tuple[int, ...], Any]],
     output_shapes: List[Tuple[Tuple[int, ...], Any]],
     constexpr_kwargs: Optional[dict] = None,
+    runtime_scalars: Optional[dict] = None,
 ) -> str:
     """Compile a ``@flyc.jit`` function and register it as an XLA custom-call target.
 
     Parameters
     ----------
     flyc_func : callable
-        A FlyDSL ``@flyc.jit``-decorated function.
+        A FlyDSL ``@flyc.jit``-decorated function (``JitFunction``).
     input_shapes : list of (shape, dtype)
         Shape and dtype of each input tensor.
     output_shapes : list of (shape, dtype)
         Shape and dtype of each output tensor.
     constexpr_kwargs : dict, optional
-        Compile-time constant keyword arguments.
+        Compile-time constant keyword arguments (``Constexpr`` parameters).
+    runtime_scalars : dict, optional
+        Runtime scalar arguments that are not tensors (e.g. ``n: Int32``).
+        Keys are parameter names, values are representative values used
+        during compilation tracing.
 
     Returns
     -------
@@ -180,15 +184,20 @@ def compile_and_register(
     """
     if constexpr_kwargs is None:
         constexpr_kwargs = {}
+    if runtime_scalars is None:
+        runtime_scalars = {}
 
-    # Build a unique name based on function + shapes.
-    sig_parts = [flyc_func.func.__name__ if hasattr(flyc_func, "func") else str(flyc_func)]
+    # Build a unique name based on function + shapes + constexprs.
+    func_name = flyc_func.func.__name__ if hasattr(flyc_func, "func") else str(flyc_func)
+    sig_parts = [func_name]
     for shape, dtype in input_shapes:
         sig_parts.append(f"i{shape}:{dtype}")
     for shape, dtype in output_shapes:
         sig_parts.append(f"o{shape}:{dtype}")
     for k, v in sorted(constexpr_kwargs.items()):
         sig_parts.append(f"c{k}={v}")
+    for k, v in sorted(runtime_scalars.items()):
+        sig_parts.append(f"r{k}={v}")
 
     name_hash = hashlib.sha256("|".join(sig_parts).encode()).hexdigest()[:16]
     target_name = f"flydsl_{name_hash}"
@@ -197,22 +206,27 @@ def compile_and_register(
         if target_name in _registered_targets:
             return target_name
 
-    # Create concrete JAX arrays to trigger FlyDSL compilation.
+    # Create concrete JAX arrays for each tensor argument.
+    from .adapter import from_jax
+
     all_arrays = []
     for shape, dtype in list(input_shapes) + list(output_shapes):
         all_arrays.append(jnp.zeros(shape, dtype=dtype))
 
-    # Import here to avoid circular imports at module level.
-    from .adapter import from_jax
-
     jit_args = [from_jax(a) for a in all_arrays]
 
-    # Trigger compilation by calling the JitFunction.
-    # We need to actually compile it, so we call the internal compile path.
-    # The simplest way is to do a dry-run call which triggers JIT.
-    flyc_func(*jit_args, **constexpr_kwargs)
+    # Build the full argument list for the @flyc.jit function.
+    # The JitFunction expects: (tensor_args..., scalar_args..., constexpr_kwargs).
+    # Runtime scalars (e.g. Int32 values) are positional arguments that
+    # FlyDSL's convert_to_jit_arguments handles via JitArgumentRegistry.
+    call_args = list(jit_args)
+    for _name, val in sorted(runtime_scalars.items()):
+        call_args.append(val)
 
-    # Now retrieve the compiled artifact from the JitFunction's cache.
+    # Trigger compilation by calling the JitFunction.
+    flyc_func(*call_args, **constexpr_kwargs)
+
+    # Retrieve the compiled artifact from the JitFunction's cache.
     jit_fn = flyc_func  # JitFunction wrapper
     if not hasattr(jit_fn, "_mem_cache") or not jit_fn._mem_cache:
         raise RuntimeError(
@@ -225,6 +239,9 @@ def compile_and_register(
     if not isinstance(artifact, CompiledArtifact):
         raise RuntimeError(f"Expected CompiledArtifact, got {type(artifact).__name__}")
 
+    # The XLA custom call only passes tensor buffers.  Non-tensor arguments
+    # (Int32, Stream) are baked into the compiled kernel at trace time.
+    # The bridge only needs to handle buffer pointers + the XLA stream.
     n_buffers = len(input_shapes) + len(output_shapes)
     target = _RegisteredTarget(target_name, artifact, n_buffers)
 
@@ -242,11 +259,15 @@ def _register_with_xla(target: _RegisteredTarget) -> None:
 
     Tries ``jax.ffi.register_ffi_target`` (modern API) first, falling back
     to ``jax.lib.xla_client.register_custom_call_target`` (legacy API).
+
+    Uses ``api_version=1`` (``API_VERSION_STATUS_RETURNING``), which
+    corresponds to the calling convention::
+
+        void fn(stream, void** buffers, const char* opaque, size_t opaque_len)
     """
     # Get the raw function pointer from the ctypes callback.
     cfunc_ptr = ctypes.cast(target.bridge_cfunc, ctypes.c_void_p).value
 
-    # Create a PyCapsule wrapping the function pointer.
     # Try the modern jax.ffi API first.
     try:
         import jax.ffi
@@ -256,7 +277,7 @@ def _register_with_xla(target: _RegisteredTarget) -> None:
             target.name,
             capsule,
             platform="rocm",
-            api_version=0,
+            api_version=1,
         )
         return
     except (AttributeError, ImportError, TypeError):
@@ -271,7 +292,7 @@ def _register_with_xla(target: _RegisteredTarget) -> None:
             target.name,
             capsule,
             platform="ROCM",
-            api_version=0,
+            api_version=1,
         )
         return
     except (AttributeError, ImportError) as exc:

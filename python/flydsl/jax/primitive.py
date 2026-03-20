@@ -23,13 +23,17 @@ Architecture
 Limitations
 -----------
 - **In-place semantics**: FlyDSL kernels write to pre-allocated output
-  buffers.  The wrapper allocates output arrays and donates them to the
-  custom call via ``output_operand_aliases``.
+  buffers.  The wrapper pre-allocates outputs and passes them as additional
+  XLA buffers to the custom call.
 - **No autograd**: ``jax.grad`` is not supported (would need explicit VJP
   rules with a backward kernel).
 - **No vmap**: Batching rules are not yet implemented.
 - **Shape-specialization**: Each unique set of input shapes triggers a new
   compilation, cached by FlyDSL's existing cache.
+- **Scalar args baked at compile time**: Non-tensor runtime arguments (e.g.
+  ``n: Int32``) are traced with their concrete values during compilation.
+  Changing them requires recompilation (use ``Constexpr`` or pass via
+  ``runtime_scalars``).
 """
 
 from __future__ import annotations
@@ -83,21 +87,31 @@ def _flydsl_impl(
     flyc_func: Callable,
     out_avals: Tuple[core.ShapedArray, ...],
     constexpr_kwargs: dict,
+    runtime_scalars: dict,
     **_kwargs,
 ):
-    """Eager implementation: compile and run via FlyDSL's normal JIT path."""
+    """Eager implementation: compile and run via FlyDSL's normal JIT path.
+
+    Note: the kernel executes asynchronously on the default HIP stream.
+    Callers should use ``jax.block_until_ready()`` on the returned arrays.
+    """
     # Allocate output arrays.
     outputs = []
     for aval in out_avals:
         outputs.append(jnp.zeros(aval.shape, dtype=aval.dtype))
 
-    # Convert all arrays to JaxTensorAdaptors.
+    # Convert all JAX arrays to JaxTensorAdaptors.
     jit_args = []
     for a in list(args) + outputs:
         jit_args.append(from_jax(a))
 
+    # Append runtime scalar values.
+    call_args = list(jit_args)
+    for _name, val in sorted(runtime_scalars.items()):
+        call_args.append(val)
+
     # Call via FlyDSL JIT (uses default stream).
-    flyc_func(*jit_args, **constexpr_kwargs)
+    flyc_func(*call_args, **constexpr_kwargs)
 
     return tuple(outputs)
 
@@ -109,8 +123,8 @@ flydsl_call_p.def_impl(_flydsl_impl)
 # XLA lowering rule
 # ---------------------------------------------------------------------------
 
-# Cache: (func_id, input_shapes_key) -> registered target name
-_lowering_cache: Dict[str, str] = {}
+# Cache: hashable key -> registered target name
+_lowering_cache: Dict[tuple, str] = {}
 
 
 def _shapes_key(avals):
@@ -124,6 +138,7 @@ def _flydsl_lowering(
     flyc_func: Callable,
     out_avals: Tuple[core.ShapedArray, ...],
     constexpr_kwargs: dict,
+    runtime_scalars: dict,
 ):
     """MLIR lowering rule: emit a ``stablehlo.custom_call`` backed by the
     compiled FlyDSL kernel.
@@ -134,6 +149,9 @@ def _flydsl_lowering(
        the kernel hasn't been compiled for these shapes yet.
     3. Emits a ``stablehlo.CustomCallOp`` that XLA will dispatch to the
        registered bridge function at runtime.
+
+    Non-tensor arguments (``runtime_scalars``) are baked into the compiled
+    kernel during tracing — the XLA custom call only receives tensor buffers.
     """
     from .ffi_bridge import compile_and_register
 
@@ -142,7 +160,14 @@ def _flydsl_lowering(
 
     # Build cache key.
     func_id = id(flyc_func)
-    cache_key = (func_id, _shapes_key(avals_in), _shapes_key(avals_out), tuple(sorted(constexpr_kwargs.items())))
+    rt_key = tuple(sorted(runtime_scalars.items()))
+    cache_key = (
+        func_id,
+        _shapes_key(avals_in),
+        _shapes_key(avals_out),
+        tuple(sorted(constexpr_kwargs.items())),
+        rt_key,
+    )
 
     target_name = _lowering_cache.get(cache_key)
     if target_name is None:
@@ -155,6 +180,7 @@ def _flydsl_lowering(
             input_shapes=input_shapes,
             output_shapes=output_shapes,
             constexpr_kwargs=constexpr_kwargs,
+            runtime_scalars=runtime_scalars,
         )
         _lowering_cache[cache_key] = target_name
 
@@ -162,24 +188,21 @@ def _flydsl_lowering(
     result_types = [jax_mlir.aval_to_ir_type(aval) for aval in avals_out]
 
     # Emit the custom call.
-    # api_version=1 corresponds to the "typed" API; api_version=0 is the
-    # legacy "untyped" API where buffers are passed as void**.
-    # We use the untyped API (version 1 in StableHLO terms maps to
-    # API_VERSION_STATUS_RETURNING in XLA; version 0 is API_VERSION_UNTYPED).
     #
     # StableHLO custom_call api_version attribute:
     #   0 = API_VERSION_ORIGINAL (not recommended)
     #   1 = API_VERSION_STATUS_RETURNING
-    #   2 = API_VERSION_STATUS_RETURNING_UNIFIED (default for mlir.custom_call)
+    #   2 = API_VERSION_STATUS_RETURNING_UNIFIED
     #   4 = API_VERSION_TYPED_FFI
     #
-    # For our void** calling convention we need version 1 (buffers as void**,
-    # separate stream, inputs before outputs).
+    # We use api_version=1 (STATUS_RETURNING): the registered function
+    # receives (stream, void** buffers, opaque, opaque_len).
+    # This must match the api_version used in ffi_bridge._register_with_xla.
     call = stablehlo.CustomCallOp(
         result_types,
         list(args),
         call_target_name=target_name,
-        api_version=1,  # STATUS_RETURNING: fn(stream, buffers, opaque, opaque_len)
+        api_version=1,
         backend_config=b"",
         has_side_effect=True,  # FlyDSL kernels write to output buffers.
     )
@@ -202,17 +225,13 @@ except Exception:
 # jax_kernel wrapper
 # ---------------------------------------------------------------------------
 
-GridSpec = Union[
-    Tuple[int, ...],
-    Callable[..., Tuple[int, ...]],
-]
-
 
 def jax_kernel(
     flyc_func: Callable,
     *,
     out_shapes: Callable,
     constexpr_kwargs: Optional[dict] = None,
+    runtime_scalars: Optional[dict] = None,
 ) -> Callable:
     """Wrap a ``@flyc.jit`` function for use inside ``jax.jit``.
 
@@ -221,32 +240,38 @@ def jax_kernel(
     flyc_func : callable
         A FlyDSL ``@flyc.jit``-decorated function.
     out_shapes : callable
-        A function ``(*input_arrays) -> list[(shape, dtype)]`` that returns
+        A function ``(*wrapper_args) -> list[(shape, dtype)]`` that returns
         the shape and dtype of each output tensor the kernel will produce.
         FlyDSL kernels write to pre-allocated output buffers, so the caller
         must specify the output layout.
     constexpr_kwargs : dict, optional
         Compile-time constant keyword arguments forwarded to the FlyDSL
         function (``Constexpr`` parameters).
+    runtime_scalars : dict, optional
+        Non-tensor runtime arguments (e.g. ``{"n": 128}``).  These are
+        passed to the FlyDSL function during compilation tracing but are
+        NOT passed through the XLA custom call at runtime — they are baked
+        into the compiled kernel.  Changing them requires recompilation.
 
     Returns
     -------
     callable
-        A function with the same input signature that returns JAX arrays
-        and is compatible with ``jax.jit``.
+        A function that accepts only JAX array arguments and returns a
+        tuple of JAX output arrays.  Compatible with ``jax.jit``.
 
     Examples
     --------
     ::
 
         @flyc.jit
-        def my_add(A, B, C, n, stream):
+        def my_add(A, B, C, n, const_n, stream):
             ...
 
         wrapped = jax_kernel(
             my_add,
             out_shapes=lambda a, b: [(a.shape, a.dtype)],
             constexpr_kwargs={"const_n": 129},
+            runtime_scalars={"n": 128},
         )
 
         @jax.jit
@@ -256,20 +281,25 @@ def jax_kernel(
     """
     if constexpr_kwargs is None:
         constexpr_kwargs = {}
+    if runtime_scalars is None:
+        runtime_scalars = {}
 
     @functools.wraps(flyc_func)
     def wrapper(*args):
-        # Compute output abstract values.
+        # Compute output abstract values from the user-provided function.
         out_specs = out_shapes(*args)
         out_avals = tuple(
             core.ShapedArray(shape, dtype) for shape, dtype in out_specs
         )
 
+        # Only JAX arrays are passed as primitive operands — scalars are
+        # carried as primitive parameters and baked into the compiled kernel.
         return flydsl_call_p.bind(
             *args,
             flyc_func=flyc_func,
             out_avals=out_avals,
             constexpr_kwargs=constexpr_kwargs,
+            runtime_scalars=runtime_scalars,
         )
 
     return wrapper

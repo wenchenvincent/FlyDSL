@@ -132,14 +132,17 @@ def run_eager_jax():
 
 
 # Wrap the @flyc.jit function so it can be used inside jax.jit.
-# out_shapes tells JAX the shape and dtype of each output the kernel produces.
-# constexpr_kwargs are compile-time constants forwarded to FlyDSL.
+# - out_shapes: tells JAX the shape and dtype of each output.
+# - constexpr_kwargs: compile-time constants (Constexpr parameters).
+# - runtime_scalars: non-tensor runtime args baked into the compiled kernel.
+#   The scalar 'n' is traced with value 128 during FlyDSL compilation.
 vectorAdd_jax = jax_kernel(
     vectorAdd,
-    out_shapes=lambda a, b, n_val: [
+    out_shapes=lambda a, b: [
         (a.shape, a.dtype),  # output C has same shape/dtype as A
     ],
     constexpr_kwargs={"const_n": 129},
+    runtime_scalars={"n": 128},
 )
 
 
@@ -157,8 +160,9 @@ def run_jit_jax():
 
     @jax.jit
     def add_vectors(a, b):
-        # vectorAdd_jax returns a tuple of outputs (one element: C).
-        (c,) = vectorAdd_jax(a, b, n)
+        # vectorAdd_jax receives only JAX arrays; scalar args (n) are baked
+        # into the compiled kernel via runtime_scalars.
+        (c,) = vectorAdd_jax(a, b)
         return c
 
     C = add_vectors(A, B)
