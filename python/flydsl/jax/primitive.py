@@ -17,8 +17,8 @@ Architecture
 3. At XLA lowering time, the FlyDSL kernel is JIT-compiled for the concrete
    shapes, and the resulting GPU binary is registered as a custom-call
    target.  The XLA ``CustomCall`` HLO is emitted.
-4. At execution time, XLA invokes the custom call on its own stream — no
-   explicit stream management is needed.
+4. At execution time, XLA invokes the custom call on its own HIP stream —
+   no explicit stream management is needed.
 
 Limitations
 -----------
@@ -34,18 +34,17 @@ Limitations
 
 from __future__ import annotations
 
-import ctypes
 import functools
-import hashlib
-import threading
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, Optional, Tuple, Union
 
 try:
     import jax
     import jax.numpy as jnp
     from jax import core
     from jax.interpreters import mlir as jax_mlir
+
+    # StableHLO dialect ops used in the lowering rule.
+    from jax._src.lib.mlir.dialects import hlo as stablehlo
 except ImportError as exc:
     raise ImportError(
         "JAX is required for flydsl.jax.  Install with:\n"
@@ -53,21 +52,6 @@ except ImportError as exc:
     ) from exc
 
 from .adapter import JaxTensorAdaptor, from_jax
-
-# ---------------------------------------------------------------------------
-# Compiled kernel registry (thread-safe)
-# ---------------------------------------------------------------------------
-
-_registry_lock = threading.Lock()
-_compiled_kernels: Dict[str, Any] = {}  # name -> CompiledArtifact
-
-
-def _register_kernel(name: str, artifact) -> str:
-    """Register a compiled FlyDSL artifact for XLA custom-call dispatch."""
-    with _registry_lock:
-        _compiled_kernels[name] = artifact
-    return name
-
 
 # ---------------------------------------------------------------------------
 # JAX Primitive
@@ -102,8 +86,6 @@ def _flydsl_impl(
     **_kwargs,
 ):
     """Eager implementation: compile and run via FlyDSL's normal JIT path."""
-    from ..expr.typing import Stream
-
     # Allocate output arrays.
     outputs = []
     for aval in out_avals:
@@ -124,6 +106,99 @@ flydsl_call_p.def_impl(_flydsl_impl)
 
 
 # ---------------------------------------------------------------------------
+# XLA lowering rule
+# ---------------------------------------------------------------------------
+
+# Cache: (func_id, input_shapes_key) -> registered target name
+_lowering_cache: Dict[str, str] = {}
+
+
+def _shapes_key(avals):
+    """Create a hashable key from a sequence of abstract values."""
+    return tuple((a.shape, a.dtype) for a in avals)
+
+
+def _flydsl_lowering(
+    ctx: jax_mlir.LoweringRuleContext,
+    *args,
+    flyc_func: Callable,
+    out_avals: Tuple[core.ShapedArray, ...],
+    constexpr_kwargs: dict,
+):
+    """MLIR lowering rule: emit a ``stablehlo.custom_call`` backed by the
+    compiled FlyDSL kernel.
+
+    This function is called during ``jax.jit`` lowering.  It:
+    1. Computes input/output shape signatures from ``ctx.avals_in``/``ctx.avals_out``.
+    2. Triggers FlyDSL compilation (via ``ffi_bridge.compile_and_register``) if
+       the kernel hasn't been compiled for these shapes yet.
+    3. Emits a ``stablehlo.CustomCallOp`` that XLA will dispatch to the
+       registered bridge function at runtime.
+    """
+    from .ffi_bridge import compile_and_register
+
+    avals_in = ctx.avals_in
+    avals_out = ctx.avals_out
+
+    # Build cache key.
+    func_id = id(flyc_func)
+    cache_key = (func_id, _shapes_key(avals_in), _shapes_key(avals_out), tuple(sorted(constexpr_kwargs.items())))
+
+    target_name = _lowering_cache.get(cache_key)
+    if target_name is None:
+        # Compile the FlyDSL function and register it as an XLA custom-call target.
+        input_shapes = [(tuple(a.shape), a.dtype) for a in avals_in]
+        output_shapes = [(tuple(a.shape), a.dtype) for a in avals_out]
+
+        target_name = compile_and_register(
+            flyc_func,
+            input_shapes=input_shapes,
+            output_shapes=output_shapes,
+            constexpr_kwargs=constexpr_kwargs,
+        )
+        _lowering_cache[cache_key] = target_name
+
+    # Build MLIR result types for each output.
+    result_types = [jax_mlir.aval_to_ir_type(aval) for aval in avals_out]
+
+    # Emit the custom call.
+    # api_version=1 corresponds to the "typed" API; api_version=0 is the
+    # legacy "untyped" API where buffers are passed as void**.
+    # We use the untyped API (version 1 in StableHLO terms maps to
+    # API_VERSION_STATUS_RETURNING in XLA; version 0 is API_VERSION_UNTYPED).
+    #
+    # StableHLO custom_call api_version attribute:
+    #   0 = API_VERSION_ORIGINAL (not recommended)
+    #   1 = API_VERSION_STATUS_RETURNING
+    #   2 = API_VERSION_STATUS_RETURNING_UNIFIED (default for mlir.custom_call)
+    #   4 = API_VERSION_TYPED_FFI
+    #
+    # For our void** calling convention we need version 1 (buffers as void**,
+    # separate stream, inputs before outputs).
+    call = stablehlo.CustomCallOp(
+        result_types,
+        list(args),
+        call_target_name=target_name,
+        api_version=1,  # STATUS_RETURNING: fn(stream, buffers, opaque, opaque_len)
+        backend_config=b"",
+        has_side_effect=True,  # FlyDSL kernels write to output buffers.
+    )
+
+    return call.results
+
+
+# Register the lowering for the ROCm platform.
+# JAX uses "rocm" as the platform name for AMD GPUs.
+jax_mlir.register_lowering(flydsl_call_p, _flydsl_lowering, platform="rocm")
+
+# Also register for "gpu" platform (some JAX versions use this generically).
+try:
+    jax_mlir.register_lowering(flydsl_call_p, _flydsl_lowering, platform="gpu")
+except Exception:
+    pass
+
+
+# ---------------------------------------------------------------------------
 # jax_kernel wrapper
 # ---------------------------------------------------------------------------
 
@@ -131,15 +206,6 @@ GridSpec = Union[
     Tuple[int, ...],
     Callable[..., Tuple[int, ...]],
 ]
-
-
-@dataclass
-class JaxKernelConfig:
-    """Configuration for a JAX-wrapped FlyDSL kernel."""
-
-    flyc_func: Callable
-    out_shapes: Callable  # (input_shapes) -> list of (shape, dtype)
-    constexpr_kwargs: dict
 
 
 def jax_kernel(

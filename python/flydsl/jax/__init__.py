@@ -28,17 +28,23 @@ Usage (jax.jit)::
 
     from flydsl.jax import jax_kernel
 
-    wrapped = jax_kernel(my_flyc_jit_func, grid=..., block=...)
+    wrapped = jax_kernel(
+        my_flyc_jit_func,
+        out_shapes=lambda a, b: [(a.shape, a.dtype)],
+    )
 
     @jax.jit
     def f(a, b):
-        return wrapped(a, b)
+        (c,) = wrapped(a, b)
+        return c
 """
 
 from flydsl.jax.adapter import JaxTensorAdaptor, from_jax
+from flydsl.jax.ffi_bridge import compile_and_register
 from flydsl.jax.primitive import jax_kernel
 
 __all__ = [
+    "compile_and_register",
     "from_jax",
     "JaxTensorAdaptor",
     "jax_kernel",

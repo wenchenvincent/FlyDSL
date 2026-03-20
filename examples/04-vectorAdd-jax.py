@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-"""Vector addition example using FlyDSL with JAX arrays (eager mode).
+"""Vector addition example using FlyDSL with JAX arrays.
 
-This is the JAX equivalent of ``01-vectorAdd.py``.  It demonstrates
-Level 1 integration: wrapping JAX arrays via ``from_jax`` and calling
-a ``@flyc.jit`` function directly.
+This is the JAX equivalent of ``01-vectorAdd.py``.  It demonstrates both:
+
+- **Level 1** (eager): wrapping JAX arrays via ``from_jax`` and calling
+  a ``@flyc.jit`` function directly.
+- **Level 2** (``jax.jit``): wrapping a ``@flyc.jit`` function with
+  ``jax_kernel`` so it can be called inside ``jax.jit``.
 
 Requirements:
     pip install jax[rocm]   # ROCm backend for AMD GPUs
@@ -16,7 +19,7 @@ import jax.numpy as jnp
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.jax import from_jax
+from flydsl.jax import from_jax, jax_kernel
 
 
 # ---------- Kernel definition (identical to 01-vectorAdd.py) ----------
@@ -125,9 +128,65 @@ def run_eager_jax():
     return bool(is_close)
 
 
+# ---------- Level 2: jax.jit integration via jax_kernel ----------
+
+
+# Wrap the @flyc.jit function so it can be used inside jax.jit.
+# out_shapes tells JAX the shape and dtype of each output the kernel produces.
+# constexpr_kwargs are compile-time constants forwarded to FlyDSL.
+vectorAdd_jax = jax_kernel(
+    vectorAdd,
+    out_shapes=lambda a, b, n_val: [
+        (a.shape, a.dtype),  # output C has same shape/dtype as A
+    ],
+    constexpr_kwargs={"const_n": 129},
+)
+
+
+def run_jit_jax():
+    """jax.jit-compiled execution with JAX arrays.
+
+    The FlyDSL kernel is compiled once and registered as an XLA custom call.
+    Subsequent calls reuse the compiled kernel with zero Python overhead.
+    """
+    n = 128
+
+    key = jax.random.PRNGKey(42)
+    A = jax.random.randint(key, (n,), 0, 10).astype(jnp.float32)
+    B = jax.random.randint(jax.random.PRNGKey(7), (n,), 0, 10).astype(jnp.float32)
+
+    @jax.jit
+    def add_vectors(a, b):
+        # vectorAdd_jax returns a tuple of outputs (one element: C).
+        (c,) = vectorAdd_jax(a, b, n)
+        return c
+
+    C = add_vectors(A, B)
+    expected = A + B
+    is_close = jnp.allclose(C, expected)
+    print(f"[JAX jit] Result correct: {is_close}")
+    if not is_close:
+        print("  A:", A[:16])
+        print("  B:", B[:16])
+        print("  C:", C[:16])
+        print("  expected:", expected[:16])
+    return bool(is_close)
+
+
 if __name__ == "__main__":
     print("=" * 50)
-    print("FlyDSL + JAX: Vector Addition (Eager)")
+    print("Test 1: FlyDSL + JAX (Eager)")
     print("=" * 50)
-    ok = run_eager_jax()
-    print(f"\nPassed: {ok}")
+    ok1 = run_eager_jax()
+
+    print()
+    print("=" * 50)
+    print("Test 2: FlyDSL + JAX (jax.jit)")
+    print("=" * 50)
+    try:
+        ok2 = run_jit_jax()
+    except Exception as e:
+        print(f"[JAX jit] FAILED with exception: {e}")
+        ok2 = False
+
+    print(f"\nAll passed: {ok1 and ok2}")
